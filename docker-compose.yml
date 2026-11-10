@@ -1,0 +1,16 @@
+# Run Eden as a website on your own machine or server:
+#   EDEN_WEB_PASSWORD=choose-a-password docker compose up -d --build
+# then open http://localhost:8080
+services:
+  eden:
+    build: .
+    # image: ghcr.io/YOUR-GITHUB-NAME/YOUR-REPO:latest   # use the image built by GitHub instead of building here
+    ports:
+      - "8080:8080"
+    environment:
+      EDEN_WEB_PASSWORD: "${EDEN_WEB_PASSWORD:?set EDEN_WEB_PASSWORD to the website password}"
+    volumes:
+      - eden-data:/data
+    restart: unless-stopped
+volumes:
+  eden-data: {}

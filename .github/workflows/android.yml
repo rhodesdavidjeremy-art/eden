@@ -1,0 +1,162 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  QT_VERSION: "6.7.3"
+  QT_NDK_VERSION: "26.1.10909125"      # the NDK Qt 6.7 is built for
+  PYTHON_TAG: "v3.13.5"                 # CPython tag built for Android (needs Android/android.py)
+  SQLITE_URL: "https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip"
+
+jobs:
+  core-tests:
+    name: Core + Python + in-app Python tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsqlite3-dev python3 python3-dev libpython3-dev zip unzip
+      - name: Build and run every C++ and Python test
+        run: sh scripts/check.sh
+      - name: Test the embedded-Python path used on Android (bundle -> unpack -> in-process sidecar)
+        run: packaging/android/embedded_smoke.sh
+
+  apk:
+    name: Build APK (arm64-v8a)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake build-essential zip unzip curl \
+            libssl-dev libffi-dev zlib1g-dev libsqlite3-dev libbz2-dev liblzma-dev libreadline-dev uuid-dev
+
+      - name: Android SDK pieces
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" "ndk;${QT_NDK_VERSION}"
+
+      - name: Restore CPython-for-Android build cache
+        id: pycache
+        uses: actions/cache@v4
+        with:
+          path: cpython-android
+          key: cpython-android-${{ env.PYTHON_TAG }}-${{ hashFiles('packaging/android/build_python.sh') }}
+
+      - name: Build CPython for Android
+        id: python
+        run: |
+          packaging/android/build_python.sh | tee python-build.log
+          echo "prefix=$(grep '^PYTHON_PREFIX=' python-build.log | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+          echo "hostpy=$(grep '^PYTHON_HOST_BIN=' python-build.log | cut -d= -f2-)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Qt (host + Android)
+        run: |
+          pip install "aqtinstall>=3.1"
+          aqt install-qt linux desktop "$QT_VERSION" linux_gcc_64 -O "$HOME/Qt"
+          aqt install-qt linux android "$QT_VERSION" android_arm64_v8a -m qtmultimedia qtshadertools -O "$HOME/Qt" \
+            || aqt install-qt linux android "$QT_VERSION" android_arm64_v8a -O "$HOME/Qt"
+          ls "$HOME/Qt/$QT_VERSION"
+
+      - name: Fetch SQLite amalgamation (compiled into the app with FTS5)
+        run: |
+          curl -fL -o sqlite.zip "$SQLITE_URL"
+          unzip -q sqlite.zip -d sqlite-src
+          echo "SQLITE_DIR=$(dirname "$(find sqlite-src -name sqlite3.c | head -n 1)")" >> "$GITHUB_ENV"
+
+      - name: Prepare Android package folder (manifest + Python bundle)
+        run: |
+          QT_ANDROID="$HOME/Qt/$QT_VERSION/android_arm64_v8a"
+          python3 packaging/android/make_manifest.py "$QT_ANDROID" android-pkg/AndroidManifest.xml
+          packaging/android/make_bundle.sh "${{ steps.python.outputs.prefix }}" "${{ steps.python.outputs.hostpy }}" android-pkg/assets/python-bundle.zip
+
+      - name: Configure
+        run: |
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$QT_NDK_VERSION"
+          "$HOME/Qt/$QT_VERSION/android_arm64_v8a/bin/qt-cmake" -S . -B build-android -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DQT_HOST_PATH="$HOME/Qt/$QT_VERSION/gcc_64" \
+            -DANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" -DANDROID_NDK_ROOT="$ANDROID_NDK_ROOT" \
+            -DEDEN_BUILD_TESTS=OFF -DEDEN_BUILD_UI=ON \
+            -DEDEN_SQLITE_AMALGAMATION_DIR="$SQLITE_DIR" \
+            -DEDEN_EMBED_PYTHON_PREFIX="${{ steps.python.outputs.prefix }}" \
+            -DEDEN_ANDROID_PACKAGE_DIR="$PWD/android-pkg"
+
+      - name: Build APK
+        run: |
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/$QT_NDK_VERSION"
+          cmake --build build-android --target eden_reader_make_apk -j
+
+      - name: Sign the APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -e
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+          APK="$(find build-android -name '*.apk' | head -n 1)"
+          test -n "$APK" || { echo "no APK produced"; find build-android -maxdepth 6 -name 'android-build*' ; exit 1; }
+          echo "built: $APK"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.jks
+            PASS="$KEYSTORE_PASS"; ALIAS="${KEY_ALIAS:-eden}"
+          else
+            # No keystore supplied: create a throw-away one. The APK installs fine, but a later build signed with a
+            # different key must be installed after uninstalling this one. Add the three secrets to keep one key.
+            PASS="edenreader"; ALIAS="eden"
+            keytool -genkeypair -keystore release.jks -storepass "$PASS" -keypass "$PASS" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Eden Research Reader"
+          fi
+          "$BT/zipalign" -f -p 4 "$APK" aligned.apk
+          "$BT/apksigner" sign --ks release.jks --ks-pass "pass:$PASS" --key-pass "pass:$PASS" --ks-key-alias "$ALIAS" \
+            --out EdenReader-android-arm64.apk aligned.apk
+          "$BT/apksigner" verify --verbose EdenReader-android-arm64.apk
+          rm -f release.jks aligned.apk
+
+      - name: Check the APK really contains the app, Python and the bundle
+        run: |
+          set -e
+          unzip -l EdenReader-android-arm64.apk > apk-contents.txt
+          grep -q 'lib/arm64-v8a/libeden_reader' apk-contents.txt
+          grep -q 'lib/arm64-v8a/libpython3' apk-contents.txt
+          grep -q 'assets/python-bundle.zip' apk-contents.txt
+          grep -c 'lib/arm64-v8a/' apk-contents.txt
+          # libpython must be referenced by its soname, never by a build-machine path
+          mkdir -p chk && unzip -q -o EdenReader-android-arm64.apk 'lib/arm64-v8a/libeden_reader*' -d chk
+          READELF="$(find "$ANDROID_HOME/ndk/$QT_NDK_VERSION" -name llvm-readelf | head -n 1)"
+          "$READELF" -d chk/lib/arm64-v8a/libeden_reader*.so | grep NEEDED | tee needed.txt
+          if grep -q '/' needed.txt; then echo 'libeden_reader references a library by path'; exit 1; fi
+          ls -lh EdenReader-android-arm64.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EdenReader-android-arm64-apk
+          path: EdenReader-android-arm64.apk
+
+      - name: Attach to GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EdenReader-android-arm64.apk

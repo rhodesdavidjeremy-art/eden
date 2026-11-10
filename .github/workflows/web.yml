@@ -1,0 +1,130 @@
+name: Website (container image)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  tests:
+    name: Core, Python and gateway tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsqlite3-dev python3
+      - name: C++ suite (AddressSanitizer) and Python suite
+        run: sh scripts/check.sh
+      - name: Gateway tests (login, files, WebSocket proxy)
+        run: python3 -m unittest tests.web.test_gateway -v
+      - name: Gateway WebSocket check with Node's standards-compliant client
+        run: |
+          cat > /tmp/ws_driver.py <<'PY'
+          import subprocess, sys, threading, tempfile, http.client
+          sys.path.insert(0, "web"); sys.path.insert(0, "tests/web")
+          import gateway
+          from test_gateway import EchoVnc, free_port
+          vnc = EchoVnc(); vnc.start(); tmp = tempfile.mkdtemp()
+          cfg = gateway.Config({"EDEN_WEB_PASSWORD": "pw", "EDEN_WEB_PORT": str(free_port()), "EDEN_WEB_HOST": "127.0.0.1",
+              "EDEN_VNC_PORT": str(vnc.port), "EDEN_FILES_DIR": tmp + "/f", "EDEN_NOVNC_DIR": tmp})
+          srv = gateway.Server(cfg); threading.Thread(target=srv.serve_forever, daemon=True).start()
+          c = http.client.HTTPConnection("127.0.0.1", cfg.port)
+          c.request("POST", "/login", "password=pw", {"Content-Type": "application/x-www-form-urlencoded"})
+          cookie = c.getresponse().getheader("Set-Cookie").split(";")[0]
+          r = subprocess.run(["node", "tests/web/ws_node_check.mjs", str(cfg.port), cookie], capture_output=True, text=True, timeout=60)
+          print(r.stdout, r.stderr); sys.exit(r.returncode)
+          PY
+          python3 /tmp/ws_driver.py
+
+  image:
+    name: Build, smoke-test and publish the image
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=sha
+
+      - name: Build the image (fails if the app does not compile)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: eden-reader-web:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start the container
+        run: |
+          docker run -d --name eden -p 8080:8080 -e EDEN_WEB_PASSWORD=ci-password eden-reader-web:ci
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8080/healthz
+
+      - name: Eden itself is running on the virtual screen
+        run: |
+          for i in $(seq 1 30); do
+            docker exec eden pgrep -x eden_reader >/dev/null && break
+            sleep 2
+          done
+          docker exec eden pgrep -x eden_reader
+          sleep 8
+          # still alive after start-up (not crashed)
+          docker exec eden pgrep -x eden_reader
+
+      - name: Smoke test through the website
+        run: python3 tests/web/container_smoke.py http://127.0.0.1:8080 ci-password
+
+      - name: Take a screenshot of the desktop
+        if: always()
+        run: |
+          docker exec eden bash -c 'DISPLAY=:0 xwd -root -silent' > screen.xwd || true
+          docker logs eden > container.log 2>&1 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-debug
+          path: |
+            screen.xwd
+            container.log
+          if-no-files-found: ignore
+
+      - name: Publish image to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

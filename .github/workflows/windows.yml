@@ -1,0 +1,151 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_EMBED_VERSION: "3.12.8"
+
+jobs:
+  core-tests:
+    name: Core + Python tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsqlite3-dev python3
+      - name: Build and run every C++ and Python test
+        run: sh scripts/check.sh
+
+  windows:
+    name: Windows exe (portable zip + installer)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-sqlite3
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-multimedia
+            mingw-w64-x86_64-qt6-tools
+            zip
+            unzip
+            curl
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DEDEN_BUILD_TESTS=OFF -DEDEN_BUILD_UI=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Assemble portable folder
+        run: |
+          set -e
+          rm -rf dist && mkdir -p dist/Eden
+          test -f build/bin/eden_reader.exe
+          cp build/bin/eden_reader.exe dist/Eden/
+          # Qt runtime (best effort) - the DLL sweep below guarantees completeness
+          WDQ="$(command -v windeployqt6 || command -v windeployqt-qt6 || command -v windeployqt || true)"
+          if [ -n "$WDQ" ]; then "$WDQ" --no-translations dist/Eden/eden_reader.exe || echo "windeployqt reported problems; falling back to manual plugin copy"; fi
+          PLUGINS=/mingw64/share/qt6/plugins
+          mkdir -p dist/Eden/platforms dist/Eden/styles dist/Eden/imageformats dist/Eden/tls
+          cp -n "$PLUGINS/platforms/qwindows.dll" dist/Eden/platforms/
+          for d in styles imageformats tls iconengines multimedia generic networkinformation; do
+            if [ -d "$PLUGINS/$d" ]; then mkdir -p "dist/Eden/$d"; cp -n "$PLUGINS/$d/"*.dll "dist/Eden/$d/" || true; fi
+          done
+          # Copy every mingw64 DLL the exe and the plugins depend on, repeating until nothing new appears
+          for pass in 1 2 3 4 5 6; do
+            for f in $(find dist/Eden -name '*.exe' -o -name '*.dll'); do
+              ldd "$f" 2>/dev/null | awk '/\/mingw64\/bin\//{print $3}'
+            done | sort -u | while read -r dll; do cp -n "$dll" dist/Eden/ ; done
+          done
+          # Embedded Python for the AI sidecar
+          curl -fL -o python-embed.zip "https://www.python.org/ftp/python/${PYTHON_EMBED_VERSION}/python-${PYTHON_EMBED_VERSION}-embed-amd64.zip"
+          mkdir -p dist/Eden/python-runtime
+          unzip -q python-embed.zip -d dist/Eden/python-runtime
+          PTH="$(ls dist/Eden/python-runtime/python*._pth | head -n 1)"
+          ZIPNAME="$(basename "$PTH" ._pth).zip"
+          printf '%s\n.\n..\\python\n' "$ZIPNAME" > "$PTH"
+          # Sidecar sources, docs
+          cp -r python dist/Eden/python
+          cp README.md BUILD_ON_GITHUB.md dist/Eden/ 
+          cp -r docs dist/Eden/docs
+          echo "--- portable folder:"; du -sh dist/Eden; ls dist/Eden
+
+      - name: Verify the bundled Python sidecar (import, catalog, JSON round trip)
+        run: |
+          set -e
+          cd dist/Eden
+          ./python-runtime/python.exe -c "import sys; sys.path.insert(0, 'python'); import eden_ai; from eden_ai.functions.catalog import CATALOG; print('eden_ai ok, catalog entries:', len(CATALOG))"
+          printf '{"id":"1","method":"cache.stats","params":{}}\n{"id":"2","method":"shutdown","params":{}}\n' | ./python-runtime/python.exe -m eden_ai | tee sidecar-reply.txt
+          grep -q '"ok":true' sidecar-reply.txt
+          rm sidecar-reply.txt
+
+      - name: Run the Python test-suite with the bundled interpreter
+        continue-on-error: true
+        run: |
+          cd dist/Eden/python
+          ../python-runtime/python.exe -m unittest discover -s tests -t .
+
+      - name: Verify the exe resolves all of its DLLs
+        run: |
+          set -e
+          missing=$(ldd dist/Eden/eden_reader.exe | grep -i "not found" || true)
+          if [ -n "$missing" ]; then echo "$missing"; exit 1; fi
+          echo "all DLL dependencies present"
+
+      - name: Zip portable build
+        run: |
+          cd dist
+          zip -rq ../EdenReader-windows-x64-portable.zip Eden
+          cd ..
+          ls -lh EdenReader-windows-x64-portable.zip
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          if (-not (Test-Path $iscc)) { throw "Inno Setup not available" }
+          & $iscc "packaging\windows\eden.iss"
+          Get-ChildItem dist-installer
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EdenReader-windows-x64-portable
+          path: EdenReader-windows-x64-portable.zip
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: EdenReader-windows-x64-installer
+          path: dist-installer/EdenReader-Setup.exe
+          if-no-files-found: warn
+
+      - name: Attach to GitHub release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            EdenReader-windows-x64-portable.zip
+            dist-installer/EdenReader-Setup.exe
